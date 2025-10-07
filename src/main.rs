@@ -11,6 +11,7 @@ use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
 use flate2::Compression;
 use sha1::{Sha1, Digest};
+use chrono::Local;
 
 fn cat_file(blob_hash: &str) {
     let filename = &format!(".git/objects/{}/{}", blob_hash.chars().take(2).collect::<String>(), blob_hash.chars().skip(2).collect::<String>());
@@ -262,6 +263,65 @@ fn write_tree(dir: &str) -> [u8; 20] {
     return returned_hash;
 }
 
+fn commit_tree(tree_hash: &str, parent_commit_hash: Option<&str>, message: &str) {
+    let mut content = String::new();
+    content.push_str(&format!("tree {}\n", tree_hash));
+    
+    if parent_commit_hash.is_some() {
+        content.push_str(&format!("parent {}\n", parent_commit_hash.unwrap()).to_string());
+    }
+
+    let now = Local::now();
+    let seconds = now.timestamp();
+    let timezone_offset = now.format("%z").to_string();
+
+    content.push_str(&format!("author example <commiter@example.com> {} {}\n", seconds, timezone_offset));
+    content.push_str(&format!("committer example <commiter@example.com> {} {}\n\n", seconds, timezone_offset));
+
+    content.push_str(message);
+
+    let mut to_write: Vec<u8> = vec![];
+    let header = format!("commit {}", content.bytes().len());
+    to_write.extend(header.bytes());
+    to_write.push(0u8);
+    to_write.extend(content.bytes());
+
+    // get hash
+    let mut hasher = Sha1::new();
+    hasher.update(&to_write);
+    let result = hasher.finalize();
+    let mut commit_hash = String::new();
+    for byte in result {
+        commit_hash.push_str(&format!("{:02x}", byte));
+    }
+
+    println!("{}", commit_hash);
+
+    // write tree
+    let dir = format!(".git/objects/{}/", commit_hash.chars().take(2).collect::<String>());
+    let filename = commit_hash.chars().skip(2).collect::<String>();
+
+    // create directory if doesn't exist
+    if !Path::new(&dir).exists() {
+        if fs::create_dir(&dir).is_err() {
+            println!("Couldn't create dir");
+            process::exit(1);
+        }
+    }
+
+    // write file if doesn't exist
+    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+    e.write_all(&to_write).unwrap();
+    let compressed_bytes = e.finish();
+    if compressed_bytes.is_ok() {
+        let compressed_bytes = compressed_bytes.unwrap();
+        if fs::write(dir + &filename, &compressed_bytes).is_err() {
+            println!("Couldn't write to file");
+        }
+    }
+
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args[1] == "init" {
@@ -329,7 +389,7 @@ fn main() {
     }
     // write-tree
     else if args[1] == "write-tree" {
-        if args.len() > 3 {
+        if args.len() > 2 {
             println!("usage: {} write-tree", args[0]);
             process::exit(1);
         }
@@ -339,6 +399,40 @@ fn main() {
             tree_hash.push_str(&format!("{:02x}", byte));
         }
         println!("{}", tree_hash);
+    }
+    // commit-tree
+    else if args[1] == "commit-tree" {
+        if args.len() < 5 || args.len() > 7 {
+            println!("usage: {} commit-tree <tree_hash> -m <commit-message> [-p <parent-commit-hash>]", args[0]);
+            process::exit(1);
+        }
+        let mut set_parent = false;
+        let mut set_message = false;
+        let mut tree_hash = String::new();
+        let mut parent_commit_hash: Option<&str> = None;
+        let mut message = String::new();
+
+        for i in 2..args.len() {
+            if set_parent {
+                set_parent = false;
+                parent_commit_hash = Some(&args[i]);
+            } else if set_message {
+                set_message = false;
+                message = args[i].to_string();
+            } else if args[i] == "-p" {
+                set_parent = true;
+            } else if args[i] == "-m" {
+                set_message = true;
+            } else {
+                tree_hash = args[i].to_string();
+            }
+        }
+        if tree_hash == "" {
+            println!("Error: Didn't get tree hash for commit");
+            process::exit(1);
+        }
+
+        commit_tree(&tree_hash, parent_commit_hash, &message);
     }
     else {
         println!("unknown command: {}", args[1]);
