@@ -279,6 +279,7 @@ fn commit_tree(tree_hash: &str, parent_commit_hash: Option<&str>, message: &str)
     content.push_str(&format!("committer example <commiter@example.com> {} {}\n\n", seconds, timezone_offset));
 
     content.push_str(message);
+    content.push('\n');
 
     let mut to_write: Vec<u8> = vec![];
     let header = format!("commit {}", content.bytes().len());
