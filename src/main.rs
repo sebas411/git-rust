@@ -178,12 +178,12 @@ fn ls_tree(tree_hash: &str, name_only: bool) {
 }
 
 fn write_tree(dir: &str) -> [u8; 20] {
-    let readable_dir = fs::read_dir(dir).expect("should be dir");
+    let mut readable_dir: Vec<_> = fs::read_dir(dir).unwrap().filter_map(|entry| entry.ok()).collect();
+    readable_dir.sort_by_key(|e| e.file_name());
     let mut content: Vec<u8> = vec![];
 
     // get entries from dirs and files
     for entry in readable_dir {
-        let entry = entry.unwrap();
         let path = entry.path();
         let filename = path.file_name().unwrap().to_str().unwrap();
         if filename == ".git" {
