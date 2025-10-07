@@ -3,6 +3,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::io::prelude::*;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process;
 use std::vec;
@@ -37,8 +38,9 @@ fn cat_file(blob_hash: &str) {
     }
 }
 
-fn hash_object(filename: &str, write_object: bool) {
+fn hash_object(filename: &str, write_object: bool) -> [u8; 20] {
     let file = File::open(filename);
+    let mut returned_hash = [0u8; 20];
 
     if file.is_ok() {
         let mut file = file.unwrap();
@@ -54,18 +56,18 @@ fn hash_object(filename: &str, write_object: bool) {
         // get blob object format
         let header = format!("blob {}", contents.len());
         to_write.extend(header.as_bytes());
-        to_write.push(0 as u8);
+        to_write.push(0u8);
         to_write.extend(contents.as_bytes());
 
         // get hash
         let mut hasher = Sha1::new();
         hasher.update(&to_write);
         let result = hasher.finalize();
+        returned_hash[..result.len()].copy_from_slice(&result[..]);
         let mut blob_hash = String::new();
         for byte in result {
             blob_hash.push_str(&format!("{:02x}", byte));
         }
-        println!("{}", blob_hash);
 
         // write object (if indicated)
         if write_object {
@@ -96,6 +98,7 @@ fn hash_object(filename: &str, write_object: bool) {
         println!("Problem opening '{}' file", filename);
         process::exit(1);
     }
+    return returned_hash;
 
 }
 
@@ -174,6 +177,91 @@ fn ls_tree(tree_hash: &str, name_only: bool) {
     }
 }
 
+fn write_tree(dir: &str) -> [u8; 20] {
+    let readable_dir = fs::read_dir(dir).expect("should be dir");
+    let mut content: Vec<u8> = vec![];
+
+    // get entries from dirs and files
+    for entry in readable_dir {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if filename == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            let tree_hash = write_tree(path.to_str().unwrap());
+            let mode_and_name = format!("40000 {}", filename);
+            content.extend(mode_and_name.bytes());
+            content.push(0);
+            content.extend(tree_hash);
+        } else {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let permissions = metadata.permissions();
+            let mode: u16 = permissions.mode() as u16;
+            let executable: u16 = 493u16;
+            let is_executable = (mode & executable) == executable;
+            let is_symlink = metadata.file_type().is_symlink();
+            let tree_mode;
+
+            if is_symlink {
+                tree_mode = "120000";
+            } else if is_executable {
+                tree_mode = "100755";
+            } else {
+                tree_mode = "100644";
+            }
+
+            let object_hash = hash_object(path.to_str().unwrap(), true);
+            let mode_and_name = format!("{} {}", tree_mode, filename);
+            content.extend(mode_and_name.bytes());
+            content.push(0);
+            content.extend(object_hash);
+        }
+    }
+    let mut to_write: Vec<u8> = vec![];
+    let header = format!("tree {}", content.len());
+    to_write.extend(header.bytes());
+    to_write.push(0u8);
+    to_write.extend(content);
+
+    // get hash
+    let mut hasher = Sha1::new();
+    hasher.update(&to_write);
+    let result = hasher.finalize();
+    let mut returned_hash = [0u8; 20];
+    returned_hash[..result.len()].copy_from_slice(&result[..]);
+    let mut tree_hash = String::new();
+    for byte in result {
+        tree_hash.push_str(&format!("{:02x}", byte));
+    }
+
+    // write tree
+    let dir = format!(".git/objects/{}/", tree_hash.chars().take(2).collect::<String>());
+    let filename = tree_hash.chars().skip(2).collect::<String>();
+
+    // create directory if doesn't exist
+    if !Path::new(&dir).exists() {
+        if fs::create_dir(&dir).is_err() {
+            println!("Couldn't create dir");
+            process::exit(1);
+        }
+    }
+
+    // write file if doesn't exist
+    let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+    e.write_all(&to_write).unwrap();
+    let compressed_bytes = e.finish();
+    if compressed_bytes.is_ok() {
+        let compressed_bytes = compressed_bytes.unwrap();
+        if fs::write(dir + &filename, &compressed_bytes).is_err() {
+            println!("Couldn't write to file");
+        }
+    }
+
+    return returned_hash;
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args[1] == "init" {
@@ -211,8 +299,12 @@ fn main() {
                 filename = arg
             }
         }
-        hash_object(filename, write_object);
-
+        let result = hash_object(filename, write_object);
+        let mut blob_hash = String::new();
+        for byte in result {
+            blob_hash.push_str(&format!("{:02x}", byte));
+        }
+        println!("{}", blob_hash);
     }
     // ls-tree
     else if args[1] == "ls-tree" {
@@ -234,6 +326,19 @@ fn main() {
             process::exit(1);
         }
         ls_tree(&tree_hash, name_only);
+    }
+    // write-tree
+    else if args[1] == "write-tree" {
+        if args.len() > 3 {
+            println!("usage: {} write-tree", args[0]);
+            process::exit(1);
+        }
+        let result = write_tree(".");
+        let mut tree_hash = String::new();
+        for byte in result {
+            tree_hash.push_str(&format!("{:02x}", byte));
+        }
+        println!("{}", tree_hash);
     }
     else {
         println!("unknown command: {}", args[1]);
