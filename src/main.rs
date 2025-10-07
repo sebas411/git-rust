@@ -5,6 +5,7 @@ use std::io::{BufReader, Read};
 use std::io::prelude::*;
 use std::path::Path;
 use std::process;
+use std::vec;
 use flate2::write::ZlibEncoder;
 use flate2::read::ZlibDecoder;
 use flate2::Compression;
@@ -98,6 +99,81 @@ fn hash_object(filename: &str, write_object: bool) {
 
 }
 
+fn ls_tree(tree_hash: &str, name_only: bool) {
+    let filename = &format!(".git/objects/{}/{}", tree_hash.chars().take(2).collect::<String>(), tree_hash.chars().skip(2).collect::<String>());
+    let file = File::open(filename);
+
+    if file.is_ok() {
+        let file = file.unwrap();
+        let reader = BufReader::new(file);
+
+        let mut decoder = ZlibDecoder::new(reader);
+
+        let mut contents: Vec<u8> = vec![];
+        if decoder.read_to_end(&mut contents).is_err() {
+            println!("Error decoding blob contents");
+            process::exit(1);
+        }
+        let mut i = 0;
+        // skip "tree <size>"
+        loop {
+            if i > contents.len() || contents[i] == 0 {
+                i += 1;
+                break;
+            }
+            i += 1
+        }
+
+        let mut my_tree: Vec<(String, String, String)> = vec![];
+
+        while contents.len() > i {
+            let mut file_mode = String::new();
+            while i < contents.len() && contents[i] as char != ' ' {
+                file_mode.push(contents[i] as char);
+                i += 1;
+            }
+            i += 1;
+            
+            let mut file_name = String::new();
+            while i < contents.len() && contents[i] != 0 {
+                file_name.push(contents[i] as char);
+                i += 1;
+            }
+            i += 1;
+
+            let mut file_hash = String::new();
+            for byte in contents[i..i+20].bytes() {
+                let byte = byte.unwrap();
+                file_hash.push_str(&format!("{:02x}", byte));
+
+            }
+            i += 20;
+
+            my_tree.push((file_mode, file_name, file_hash));
+        }
+
+        if name_only {
+            for item in my_tree {
+                println!("{}", item.1);
+            }
+        } else {
+            for item in my_tree {
+                let file_type;
+                if item.0 == "40000" {
+                    file_type = "tree";
+                    print!("0");
+                } else {
+                    file_type = "blob";
+                }
+                println!("{} {} {}    {}", item.0, file_type, item.2, item.1)
+            }
+        }
+    } else {
+        println!("{} is not a valid hash for a tree", tree_hash);
+        process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args[1] == "init" {
@@ -137,6 +213,27 @@ fn main() {
         }
         hash_object(filename, write_object);
 
+    }
+    // ls-tree
+    else if args[1] == "ls-tree" {
+        if args.len() < 3 || args.len() > 4 {
+            println!("usage: {} ls-tree [--name-only] <hash-of-tree>", args[0]);
+            process::exit(1);
+        }
+        let mut tree_hash = &String::new();
+        let mut name_only = false;
+        for arg in &args[2..] {
+            if arg == "--name-only" {
+                name_only = true;
+            } else {
+                tree_hash = arg
+            }
+        }
+        if tree_hash.len() != 40 {
+            println!("Bad hash {}", tree_hash.len());
+            process::exit(1);
+        }
+        ls_tree(&tree_hash, name_only);
     }
     else {
         println!("unknown command: {}", args[1]);
