@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Cursor};
 use std::io::prelude::*;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -323,7 +323,200 @@ fn commit_tree(tree_hash: &str, parent_commit_hash: Option<&str>, message: &str)
 
 }
 
-fn main() {
+fn packet_line(line: &str) -> String {
+    format!("{:04x}{}", line.len() + 4, line)
+}
+
+/// This function saves the pack file and also initializes
+/// the local repo with obtained refs
+/// 
+/// ## Arguments
+///
+/// * `url` - The repo url
+/// * `dir_name` - Name of the directory to initialize and save pack
+///
+/// ## Example
+///
+/// ```
+/// save_pack_file("https://github.com/example/repo", "my-dir");
+/// ```
+async fn save_pack_file(url: &str, dir_name: &str) {
+    let client = reqwest::Client::new();
+    
+    // get refs
+    let result = client.get(format!("{}/info/refs?service=git-upload-pack", url)).send().await;
+    if result.is_err() {
+        println!("Error sending the request");
+        process::exit(1);
+    }
+    let response_text = result.unwrap().text().await.unwrap();
+    let mut refs: Vec<String> = vec![];
+    let mut skip_chars = 0;
+    let mut start = false;
+    while skip_chars < response_text.len() {
+        let len_hex = response_text.chars().skip(skip_chars).take(4).collect::<String>();
+        let len_dec = u32::from_str_radix(&len_hex, 16).unwrap();
+        if len_hex == "0000" {
+            if start {
+                break
+            } else {
+                start = true;
+                skip_chars += 4;
+            }
+        } else {
+            if start {
+                refs.push(response_text.chars().skip(skip_chars + 4).take(len_dec as usize - 4).collect::<String>());
+            }
+        }
+        skip_chars += len_dec as usize;
+    }
+    refs[0] = refs[0].chars().take_while(|c| *c != '\0').collect::<String>();
+    refs[0].push('\n');
+
+    let mut main_id = String::new();
+    let mut main_name = String::new();
+    let mut searching = false;
+    for i in 0..refs.len() {
+        let reference = &refs[i];
+        let sha1_id = reference.chars().take_while(|c| *c != ' ').collect::<String>();
+        let reference_name = reference.chars().skip_while(|c| *c != ' ').skip(1).take_while(|c| *c != '\n').collect::<String>();
+        if i == 0 {
+            main_id = sha1_id;
+            if reference_name == "HEAD" {
+                searching = true;
+            } else {
+                main_name = reference_name;
+            }
+        } else {
+            if searching {
+                if sha1_id == main_id {
+                    searching = false;
+                    main_name = reference_name;
+                }
+            }
+        }
+    }
+
+    // initialize local git repo
+    fs::create_dir(dir_name).unwrap();
+    fs::create_dir(format!("{}/.git", dir_name)).unwrap();
+    fs::create_dir(format!("{}/.git/objects", dir_name)).unwrap();
+    fs::create_dir(format!("{}/.git/objects/pack", dir_name)).unwrap();
+    fs::create_dir(format!("{}/.git/refs", dir_name)).unwrap();
+    fs::create_dir(format!("{}/.git/refs/heads", dir_name)).unwrap();
+    fs::write(format!("{}/.git/HEAD", dir_name), format!("ref: {}\n", main_name)).unwrap();
+    fs::write(format!("{}/.git/{}", dir_name, main_name), main_id).unwrap();
+    
+    // ask for pack file and store it
+    let mut my_request = String::new();
+    for reference in refs {
+        my_request.push_str(&packet_line(&format!("want {}", reference)));
+    }
+    my_request.push_str("0000");
+    my_request.push_str(&packet_line("done\n"));
+
+    let response = client.post(format!("{}/git-upload-pack", url)).body(my_request).header("Content-Type", "application/x-git-upload-pack-request").send().await.unwrap();
+    let mut data = response.bytes().await.unwrap().to_vec();
+    let first4bytes = String::from_utf8(data[..4].to_vec()).unwrap();
+    if first4bytes == "0008" {
+        data = data[8..].to_vec();
+    }
+    fs::write(format!("{}/.git/objects/pack/cloned.pack", dir_name), data).unwrap();
+}
+
+fn unpack_pack_file(dir_name: &str) {
+    let content = fs::read(format!("{}/.git/objects/pack/cloned.pack", dir_name)).unwrap();
+    let object_num = i32::from_be_bytes(content[8..12].try_into().unwrap());
+
+    let mut processed = 12;
+
+    for _i in 0..object_num {
+        let content = content[processed..].to_vec();
+        
+        let object_type = (content[0] & 112u8) >> 4;
+
+        let mut num_continue = content[0] > 127;
+        let mut current_byte = 0;
+        let mut object_size: u64 = (content[0] & 15u8).into();
+        while num_continue {
+            current_byte += 1;
+            num_continue = content[current_byte] > 127;
+            object_size = object_size | ((content[current_byte] & 127u8) as u64) << (4 + 7 * (current_byte - 1));
+        }
+        let content = content[current_byte+1..].to_vec();
+
+        let cursor = Cursor::new(content.clone());
+
+        let mut decoder = ZlibDecoder::new(cursor);
+
+        let mut decoded_contents: Vec<u8> = vec![0u8; object_size as usize];
+        let result = decoder.read(&mut decoded_contents);
+        if result.is_err() {
+            println!("Error decoding blob contents");
+            process::exit(1);
+        }
+
+        let mut to_write: Vec<u8> = vec![];
+        let object_type_name;
+        if object_type == 1 {
+            object_type_name = String::from("commit");
+        } else if object_type == 2 {
+            object_type_name = String::from("tree");
+        } else if object_type == 3 {
+            object_type_name = String::from("blob");
+        } else {
+            object_type_name = String::from("invalid");
+        }
+        let header = format!("{} {}", object_type_name, object_size);
+        to_write.extend(header.bytes());
+        to_write.push(0u8);
+        to_write.extend(decoded_contents);
+
+        // get hash
+        let mut hasher = Sha1::new();
+        hasher.update(&to_write);
+        let result = hasher.finalize();
+        let mut object_hash = String::new();
+        for byte in result {
+            object_hash.push_str(&format!("{:02x}", byte));
+        }
+
+        // write tree
+        let dir = format!("{}/.git/objects/{}/", dir_name, object_hash.chars().take(2).collect::<String>());
+        let filename = object_hash.chars().skip(2).collect::<String>();
+
+        // create directory if doesn't exist
+        if !Path::new(&dir).exists() {
+            if fs::create_dir(&dir).is_err() {
+                println!("Couldn't create dir");
+                process::exit(1);
+            }
+        }
+
+        // write file if doesn't exist
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&to_write).unwrap();
+        let compressed_bytes = e.finish();
+        if compressed_bytes.is_ok() {
+            let compressed_bytes = compressed_bytes.unwrap();
+            if fs::write(dir + &filename, &compressed_bytes).is_err() {
+                println!("Couldn't write to file");
+            }
+        }
+
+        let total_in = decoder.total_in() as usize;
+
+        processed += total_in + current_byte + 1;
+    }
+}
+
+async fn git_clone(url: &str, dir_name: &str) {
+    save_pack_file(url, dir_name).await;
+    unpack_pack_file(dir_name);
+}
+
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = env::args().collect();
     if args[1] == "init" {
         fs::create_dir(".git").unwrap();
@@ -434,6 +627,16 @@ fn main() {
         }
 
         commit_tree(&tree_hash, parent_commit_hash, &message);
+    }
+    // clone
+    else if args[1] == "clone" {
+        if args.len() != 4 {
+            println!("usage: {} clone <url> <directory>", args[0]);
+            process::exit(1);
+        }
+        let url = &args[2];
+        let dir_name = &args[3];
+        git_clone(url, dir_name).await;
     }
     else {
         println!("unknown command: {}", args[1]);
