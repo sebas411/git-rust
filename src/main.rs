@@ -1,9 +1,10 @@
 use std::env;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{BufReader, Read, Cursor};
 use std::io::prelude::*;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, OpenOptionsExt};
 use std::path::Path;
 use std::process;
 use std::vec;
@@ -13,8 +14,8 @@ use flate2::Compression;
 use sha1::{Sha1, Digest};
 use chrono::Local;
 
-fn cat_file(blob_hash: &str) {
-    let filename = &format!(".git/objects/{}/{}", blob_hash.chars().take(2).collect::<String>(), blob_hash.chars().skip(2).collect::<String>());
+fn cat_file(blob_hash: &str, dir_name: &str, pretty_print: bool) -> Vec<u8> {
+    let filename = &format!("{}/.git/objects/{}/{}", dir_name, blob_hash.chars().take(2).collect::<String>(), blob_hash.chars().skip(2).collect::<String>());
     let file = File::open(filename);
 
     if file.is_ok() {
@@ -23,16 +24,17 @@ fn cat_file(blob_hash: &str) {
 
         let mut decoder = ZlibDecoder::new(reader);
 
-        let mut contents = String::new();
-        if decoder.read_to_string(&mut contents).is_err() {
+        let mut contents = vec![];
+        if decoder.read_to_end(&mut contents).is_err() {
             println!("Error decoding blob contents");
             process::exit(1);
         }
-        let byte_contents = contents.bytes().skip_while(|x| *x != 0u8).skip(1).collect::<Vec<u8>>();
-        contents = String::from_utf8(byte_contents).expect("valid UTF-8");
-
-        print!("{}", contents);
-        
+        let byte_contents = contents.into_iter().skip_while(|x| *x != 0u8).skip(1).collect::<Vec<u8>>();
+        let string_contents = String::from_utf8(byte_contents.clone()).expect("valid UTF-8");
+        if pretty_print {
+            print!("{}", string_contents);
+        }
+        return byte_contents;
     } else {
         println!("{} is not a valid hash for an object", blob_hash);
         process::exit(1);
@@ -619,9 +621,100 @@ fn unpack_pack_file(dir_name: &str) {
     }
 }
 
+fn get_tree_from_current_commit(dir_name: &str) -> String {
+    let mut file = File::open(format!("{}/.git/HEAD", dir_name)).unwrap();
+    let mut branch_name = String::new();
+    file.read_to_string(&mut branch_name).unwrap();
+    branch_name = branch_name.chars().skip_while(|c| *c != ' ').skip(1).take_while(|c| *c != '\n').collect::<String>();
+
+    let filename = format!("{}/.git/{}", dir_name, branch_name);
+    let mut file = File::open(filename).unwrap();
+    let mut commit_hash = String::new();
+    file.read_to_string(&mut commit_hash).unwrap();
+
+    let commit_contents = cat_file(&commit_hash, dir_name, false);
+    let tree_hash = String::from_utf8(commit_contents[5..45].to_vec()).unwrap();
+    return tree_hash;
+}
+
+fn checkout_tree(tree_hash: &str, base_dir: &str, current_dir: &str) {
+    let filename = &format!("{}/.git/objects/{}/{}", base_dir, tree_hash.chars().take(2).collect::<String>(), tree_hash.chars().skip(2).collect::<String>());
+    let file = File::open(filename).unwrap();
+    let reader = BufReader::new(file);
+    let mut decoder = ZlibDecoder::new(reader);
+    let mut contents: Vec<u8> = vec![];
+    if decoder.read_to_end(&mut contents).is_err() {
+        println!("Error decoding blob contents");
+        process::exit(1);
+    }
+    let mut i = 0;
+    // skip "tree <size>"
+    loop {
+        if i > contents.len() || contents[i] == 0 {
+            i += 1;
+            break;
+        }
+        i += 1
+    }
+
+    // (file_mode, file_name, file_hash)
+    let mut my_tree: Vec<(String, String, String)> = vec![];
+
+    while contents.len() > i {
+        let mut file_mode = String::new();
+        while i < contents.len() && contents[i] as char != ' ' {
+            file_mode.push(contents[i] as char);
+            i += 1;
+        }
+        i += 1;
+        
+        let mut file_name = String::new();
+        while i < contents.len() && contents[i] != 0 {
+            file_name.push(contents[i] as char);
+            i += 1;
+        }
+        i += 1;
+
+        let mut file_hash = String::new();
+        for byte in contents[i..i+20].bytes() {
+            let byte = byte.unwrap();
+            file_hash.push_str(&format!("{:02x}", byte));
+
+        }
+        i += 20;
+
+        my_tree.push((file_mode, file_name, file_hash));
+    }
+
+    for item in my_tree {
+        if item.0 == "40000" {
+            let new_dir = format!("{}/{}", current_dir, item.1);
+            fs::create_dir(&new_dir).unwrap();
+            checkout_tree(&item.2, base_dir, &new_dir);
+        } else {
+            let is_executable = item.0 == "100755";
+            let permissions;
+            if is_executable {
+                permissions = 0o755;
+            } else {
+                permissions = 0o644;
+            }
+
+            let new_filepath = format!("{}/{}", current_dir, item.1);
+            let file_contents = cat_file(&item.2, base_dir, false);
+            let mut file = OpenOptions::new().create(true).write(true).mode(permissions).open(new_filepath).unwrap();
+            file.write_all(&file_contents).unwrap();
+        }
+    }
+    
+}
+
 async fn git_clone(url: &str, dir_name: &str) {
     save_pack_file(url, dir_name).await;
     unpack_pack_file(dir_name);
+    let tree_hash = get_tree_from_current_commit(dir_name);
+    checkout_tree(&tree_hash, dir_name, dir_name);
+    println!("Repository '{}' cloned correctly!", url);
 }
 
 #[tokio::main]
@@ -645,7 +738,7 @@ async fn main() {
             println!("Bad hash {}", blob_hash.len());
             process::exit(1);
         }
-        cat_file(blob_hash);
+        cat_file(blob_hash, ".", true);
     }
     // hash-object
     else if args[1] == "hash-object" {
