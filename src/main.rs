@@ -430,7 +430,7 @@ fn unpack_pack_file(dir_name: &str) {
 
     let mut processed = 12;
 
-    for _i in 0..object_num {
+    for _ in 0..object_num {
         let content = content[processed..].to_vec();
         
         let object_type = (content[0] & 112u8) >> 4;
@@ -445,32 +445,145 @@ fn unpack_pack_file(dir_name: &str) {
         }
         let content = content[current_byte+1..].to_vec();
 
-        let cursor = Cursor::new(content.clone());
+        let mut to_write: Vec<u8> = vec![];
+        // blob, commit, trees
+        if object_type < 4 && object_type != 0 {
+            let cursor = Cursor::new(content);
 
-        let mut decoder = ZlibDecoder::new(cursor);
+            let mut decoder = ZlibDecoder::new(cursor);
 
-        let mut decoded_contents: Vec<u8> = vec![0u8; object_size as usize];
-        let result = decoder.read(&mut decoded_contents);
-        if result.is_err() {
-            println!("Error decoding blob contents");
+            let mut decoded_contents: Vec<u8> = vec![0u8; object_size as usize];
+            if decoder.read(&mut decoded_contents).is_err() {
+                println!("Error decoding blob contents");
+                process::exit(1);
+            }
+
+            let object_type_name;
+            if object_type == 1 {
+                object_type_name = String::from("commit");
+            } else if object_type == 2 {
+                object_type_name = String::from("tree");
+            } else if object_type == 3 {
+                object_type_name = String::from("blob");
+            } else {
+                object_type_name = String::from("invalid");
+            }
+            let header = format!("{} {}", object_type_name, object_size);
+            to_write.extend(header.bytes());
+            to_write.push(0u8);
+            to_write.extend(decoded_contents);
+            let total_in = decoder.total_in() as usize;
+            processed += total_in + current_byte + 1;
+        }
+        // REF_DELTA
+        else if object_type == 7 {
+            let reference_hash = &content[..20];
+            let mut reference_hash_hex = String::new();
+            for i in 0..20 {
+                let byte = reference_hash[i];
+                reference_hash_hex.push_str(&format!("{:02x}", byte));
+            }
+
+            // decode instructions
+            let content = content[20..].to_vec();
+            let cursor = Cursor::new(content);
+            let mut decoder = ZlibDecoder::new(cursor);
+            let mut decoded_contents: Vec<u8> = vec![0u8; object_size as usize];
+            if decoder.read(&mut decoded_contents).is_err() {
+                println!("Error decoding blob contents");
+                process::exit(1);
+            }
+            let total_in = decoder.total_in() as usize;
+            processed += total_in + current_byte + 21;
+            let mut bytes_to_skip = 0;
+            while decoded_contents[bytes_to_skip] > 127 {
+                bytes_to_skip += 1;
+            }
+            bytes_to_skip += 1;
+            while decoded_contents[bytes_to_skip] > 127 {
+                bytes_to_skip += 1;
+            }
+            bytes_to_skip += 1;
+            let instructions = decoded_contents[bytes_to_skip..].to_vec();
+            
+            // get reference object on memory
+            let filename = &format!("{}/.git/objects/{}/{}", dir_name, reference_hash_hex.chars().take(2).collect::<String>(), reference_hash_hex.chars().skip(2).collect::<String>());
+            let file = File::open(filename).unwrap();
+            let reader = BufReader::new(file);
+            let mut decoder = ZlibDecoder::new(reader);
+            let mut reference_contents: Vec<u8> = vec![];
+            if decoder.read_to_end(&mut reference_contents).is_err() {
+                println!("Error decoding reference object contents");
+                process::exit(1);
+            }
+            let reference_object_type = reference_contents.clone().into_iter().take_while(|x| *x as char != ' ').collect::<Vec<u8>>();
+            let reference_contents = reference_contents.into_iter().skip_while(|x| *x != 0u8).skip(1).collect::<Vec<u8>>();
+            
+            // process file (copies and adds)
+            let mut new_file_contents:Vec<u8> = vec![];
+            let mut current_byte = 0;
+            while current_byte < instructions.len() {
+                let is_copy = instructions[current_byte] > 127;
+                
+                if is_copy {
+                    let mut size_to_copy= 0;
+                    let mut offset = 0;
+
+                    let mut bytes_for_size = vec![];
+                    let mut bytes_for_offset = vec![];
+                    if instructions[current_byte] & 1 > 0 {
+                        bytes_for_offset.push(24);
+                    }
+                    if instructions[current_byte] & 2 > 0 {
+                        bytes_for_offset.push(16);
+                    }
+                    if instructions[current_byte] & 4 > 0 {
+                        bytes_for_offset.push(8);
+                    }
+                    if instructions[current_byte] & 8 > 0 {
+                        bytes_for_offset.push(0);
+                    }
+                    if instructions[current_byte] & 16 > 0 {
+                        bytes_for_size.push(24);
+                    }
+                    if instructions[current_byte] & 32 > 0 {
+                        bytes_for_size.push(16);
+                    }
+                    if instructions[current_byte] & 64 > 0 {
+                        bytes_for_size.push(8);
+                    }
+                    current_byte += 1;
+                    for byte in bytes_for_offset {
+                        let my_byte = (instructions[current_byte] as u32) << byte;
+                        offset = offset | my_byte;
+                        current_byte += 1
+                    }
+                    for byte in bytes_for_size {
+                        let my_byte = (instructions[current_byte] as u32) << byte;
+                        size_to_copy = size_to_copy | my_byte;
+                        current_byte += 1
+                    }
+                    let offset = offset.to_be() as usize;
+                    let size_to_copy = size_to_copy.to_be() as usize;
+                    new_file_contents.extend(&reference_contents[offset..offset+size_to_copy]);
+ 
+                } else {
+                    let size_to_add = (instructions[current_byte] & 127u8) as usize;
+                    current_byte += 1;
+                    new_file_contents.extend(&instructions[current_byte..(current_byte + size_to_add)]);
+                    current_byte += size_to_add;
+                }
+            }
+            let header = String::from(format!("{} {}", String::from_utf8(reference_object_type).unwrap(), new_file_contents.len()));
+            to_write.extend(header.bytes());
+            to_write.push(0u8);
+            to_write.extend(new_file_contents);
+        }
+        // other object type
+        else {
+            println!("Unsupported object type");
             process::exit(1);
         }
-
-        let mut to_write: Vec<u8> = vec![];
-        let object_type_name;
-        if object_type == 1 {
-            object_type_name = String::from("commit");
-        } else if object_type == 2 {
-            object_type_name = String::from("tree");
-        } else if object_type == 3 {
-            object_type_name = String::from("blob");
-        } else {
-            object_type_name = String::from("invalid");
-        }
-        let header = format!("{} {}", object_type_name, object_size);
-        to_write.extend(header.bytes());
-        to_write.push(0u8);
-        to_write.extend(decoded_contents);
 
         // get hash
         let mut hasher = Sha1::new();
@@ -481,7 +594,7 @@ fn unpack_pack_file(dir_name: &str) {
             object_hash.push_str(&format!("{:02x}", byte));
         }
 
-        // write tree
+        // write object
         let dir = format!("{}/.git/objects/{}/", dir_name, object_hash.chars().take(2).collect::<String>());
         let filename = object_hash.chars().skip(2).collect::<String>();
 
@@ -503,10 +616,6 @@ fn unpack_pack_file(dir_name: &str) {
                 println!("Couldn't write to file");
             }
         }
-
-        let total_in = decoder.total_in() as usize;
-
-        processed += total_in + current_byte + 1;
     }
 }
 
